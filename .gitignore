@@ -1,0 +1,16 @@
+# Raw source data — не пушим (переписка гостей)
+*.xlsx
+*.xls
+
+# Checkpoint files
+threads_partial.parquet
+threads_sample_partial.parquet
+openai_partial.parquet
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Env
+.env
