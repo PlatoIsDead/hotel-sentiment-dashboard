@@ -4,3 +4,4 @@ numpy>=1.26
 plotly>=5.20
 pyarrow>=14.0
 statsmodels>=0.14
+scikit-learn>=1.4
