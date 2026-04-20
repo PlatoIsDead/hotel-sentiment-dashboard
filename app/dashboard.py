@@ -26,7 +26,7 @@ BUCKET_COLORS = ["#22c55e", "#86efac", "#fbbf24", "#ef4444"]
 
 
 @st.cache_data
-def load():
+def load_all():
     br    = pd.read_parquet(BASE / "data/booking_response.parquet")
     hs    = pd.read_parquet(BASE / "data/hotel_summary_v2.parquet")
     daily = pd.read_parquet(BASE / "data/daily_response.parquet")
@@ -40,7 +40,7 @@ def load():
     th["hotel_name"] = th["hotel_id"].map(HOTEL_NAMES)
     return br, hs, daily, th, ht, ba
 
-br, hs, daily, th, ht, ba = load()
+br, hs, daily, th, ht, ba = load_all()
 ALL_YEARS  = sorted(br["year"].dropna().unique().tolist())
 ALL_HOTELS = sorted(br["hotel_id"].unique().tolist())
 
