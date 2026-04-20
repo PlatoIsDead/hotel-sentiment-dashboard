@@ -27,76 +27,67 @@ BUCKET_COLORS = ["#22c55e", "#86efac", "#fbbf24", "#ef4444"]
 
 @st.cache_data
 def load():
-    br = pd.read_parquet(BASE / "data/booking_risk.parquet")
-    hs = pd.read_parquet(BASE / "data/hotel_summary.parquet")
-    th = pd.read_parquet(BASE / "data/threads_sample_classified.parquet")
-    ht = pd.read_parquet(BASE / "data/hotel_topics.parquet")
+    br    = pd.read_parquet(BASE / "data/booking_response.parquet")
+    hs    = pd.read_parquet(BASE / "data/hotel_summary_v2.parquet")
+    daily = pd.read_parquet(BASE / "data/daily_response.parquet")
+    th    = pd.read_parquet(BASE / "data/threads_sample_classified.parquet")
+    ht    = pd.read_parquet(BASE / "data/hotel_topics.parquet")
+    ba    = pd.read_parquet(BASE / "data/bot_answerability.parquet")
     br["first_guest_time"] = pd.to_datetime(br["first_guest_time"])
-    br.loc[br["reply_time_min"] < 0, "reply_time_min"] = np.nan
-    br["year"]       = br["first_guest_time"].dt.year
-    br["hotel_name"] = br["hotel_id"].map(HOTEL_NAMES)
-    hs["hotel_name"] = hs["hotel_id"].map(HOTEL_NAMES)
+    br["year"] = br["first_guest_time"].dt.year
+    daily["date"] = pd.to_datetime(daily["date"])
     th["thread_start"] = pd.to_datetime(th["thread_start"])
     th["hotel_name"] = th["hotel_id"].map(HOTEL_NAMES)
-    return br, hs, th, ht
+    return br, hs, daily, th, ht, ba
 
-br, hs, th, ht = load()
+br, hs, daily, th, ht, ba = load()
 ALL_YEARS  = sorted(br["year"].dropna().unique().tolist())
 ALL_HOTELS = sorted(br["hotel_id"].unique().tolist())
 
 
 st.title("🏨 Аналитика гостевых коммуникаций")
-tab1, tab2, tab3 = st.tabs(["📊 Статистика по отелям", "❓ Топ вопросы", "🔍 Браузер тредов"])
+tab1, tab2, tab3 = st.tabs(["📊 Статистика по отелям", "❓ Топ темы", "🤖 Бот vs Оператор"])
 
 # ── Вкладка 1 ─────────────────────────────────────────────────────────────────
 with tab1:
-    st.subheader("Сводка по отелям (все годы)")
-    reply_stats = (br.groupby("hotel_id")["reply_time_min"]
-        .agg(median_reply="median", mean_reply="mean",
-             p90_reply=lambda x: x.quantile(0.9))
-        .round(1).reset_index())
-    no_reply = (br.groupby("hotel_id")
-        .apply(lambda x: x["reply_time_min"].isna().sum())
-        .reset_index(name="no_reply"))
-    resp_rate = (br.groupby("hotel_id")
-        .apply(lambda x: (x["reply_time_min"].notna()).mean() * 100)
-        .round(1).reset_index(name="response_rate_%"))
-    summary = (hs[["hotel_id","hotel_name","n_bookings","avg_neg_share"]]
-               .merge(reply_stats, on="hotel_id")
-               .merge(no_reply, on="hotel_id")
-               .merge(resp_rate, on="hotel_id"))
+    st.subheader("Сводка по отелям")
     st.dataframe(
-        summary.rename(columns={
+        hs.rename(columns={
             "hotel_name": "Отель", "n_bookings": "Бронирований",
-            "response_rate_%": "% с ответом", "median_reply": "Медиана (мин)",
+            "response_rate": "% с ответом", "median_reply": "Медиана (мин)",
             "mean_reply": "Среднее (мин)", "p90_reply": "P90 (мин)",
-            "no_reply": "Без ответа", "avg_neg_share": "% негатива",
-        }).drop(columns=["hotel_id"]).set_index("Отель"),
+            "no_reply": "Без ответа", "avg_rating": "Рейтинг",
+            "n_reviews": "Отзывов", "low_rating_pct": "% низких оценок",
+        }).drop(columns=["hotel_id", "n_with_text"]).set_index("Отель"),
         use_container_width=True)
 
     st.markdown("---")
-    st.subheader("Время ответа по годам")
+    st.subheader("Динамика времени ответа")
+
+    sel_hotel_t1 = st.selectbox("Отель", sorted(daily["hotel_name"].unique()))
+    d = daily[daily["hotel_name"] == sel_hotel_t1].copy()
+
+    fig_daily = go.Figure()
+    fig_daily.add_trace(go.Scatter(
+        x=d["date"], y=d["median_reply"], mode="markers", name="Медиана по дням",
+        opacity=0.35, marker=dict(size=4, color="#93c5fd")))
+    fig_daily.add_trace(go.Scatter(
+        x=d["date"], y=d["rolling_30d"], mode="lines", name="Тренд 30д",
+        line=dict(width=2.5, color="#ef4444")))
+    fig_daily.update_layout(height=320, margin=dict(t=10, b=10),
+                             yaxis_title="Минуты", legend=dict(orientation="h", y=1.08))
+    st.plotly_chart(fig_daily, use_container_width=True)
+
+    st.markdown("---")
 
     fc1, fc2 = st.columns([3, 1])
     with fc1:
         sel_years = st.multiselect("Годы", ALL_YEARS, default=ALL_YEARS, format_func=str)
     with fc2:
-        metric = st.selectbox("Метрика", ["Медиана", "Среднее", "P90"])
+        pass
 
     br_y = br[br["year"].isin(sel_years)].copy()
-    yearly = (br_y.groupby(["hotel_id","hotel_name","year"])["reply_time_min"]
-              .agg(median="median", mean="mean", p90=lambda x: x.quantile(0.9))
-              .round(1).reset_index())
-    yearly["year"] = yearly["year"].astype(str)
-    col_name = {"Медиана": "median", "Среднее": "mean", "P90": "p90"}[metric]
 
-    fig_yr = px.line(yearly, x="year", y=col_name, color="hotel_name", markers=True,
-                     labels={col_name: f"{metric} (мин)", "year": "Год", "hotel_name": "Отель"},
-                     color_discrete_sequence=px.colors.qualitative.Set2)
-    fig_yr.update_layout(height=320, margin=dict(t=10, b=10), legend_title="Отель")
-    st.plotly_chart(fig_yr, use_container_width=True)
-
-    st.markdown("---")
     col1, col2 = st.columns(2)
 
     with col1:
@@ -123,27 +114,6 @@ with tab1:
         fig_buck.update_layout(height=340, margin=dict(t=10, b=10),
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_buck, use_container_width=True)
-
-    with st.expander("ℹ️ Как считаются эти метрики?"):
-        st.markdown("""
-**Бронирований** — общее количество уникальных броней по отелю за всё время.
-
-**% с ответом** — доля броней, где гость получил хотя бы один ответ от сотрудника. Например, 85% означает, что в 15% случаев гость написал, но ответа не последовало.
-
-**Медиана (мин)** — половина гостей получила ответ быстрее этого времени, половина — дольше. Медиана лучше среднего: не искажается редкими случаями, когда ответ ждали несколько часов.
-
-**Среднее (мин)** — среднее арифметическое времени ответа. Может быть завышено из-за единичных долгих ответов.
-
-**P90 (мин)** — 90% гостей получили ответ быстрее этого времени. Показывает «худший типичный сценарий» — насколько долго ждут самые невезучие гости.
-
-**Без ответа** — количество броней, где ответа так и не последовало.
-
-**% негатива** — доля сообщений гостя, классифицированных как негативные (жалоба, претензия, проблема). Считается языковой моделью на основе текста переписки.
-
-**Боксплот** — показывает разброс времени ответа. Линия внутри коробки — медиана, границы коробки — 25–75% случаев, усы — до 95-го перцентиля (выбросы обрезаны для читаемости).
-
-**Стопки по скорости ответа** — каждый столбец показывает, какой % броней получил ответ в течение ≤5 мин, 5–15 мин, 15–60 мин или >60 мин.
-        """)
 
 # ── Вкладка 2 ─────────────────────────────────────────────────────────────────
 with tab2:
@@ -181,56 +151,73 @@ with tab2:
 
 # ── Вкладка 3 ─────────────────────────────────────────────────────────────────
 with tab3:
-    st.subheader("Браузер тредов — последний месяц (О-44)")
-    st.caption(f"{th['thread_start'].min().date()} — {th['thread_start'].max().date()} · "
-               f"{len(th)} тредов · {th['ID_booking'].nunique()} бронирований")
+    st.subheader("Бот vs Оператор")
+    st.caption(f"{ba['thread_start'].min().date()} — {ba['thread_start'].max().date()} · "
+               f"{len(ba)} тредов · {ba['ID_booking'].nunique()} бронирований · "
+               f"{ba['hotel_name'].nunique()} отеля")
+
+    bot_pct = (ba["label"] == "BOT").mean() * 100
+    human_pct = 100 - bot_pct
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Всего тредов", len(ba))
+    m2.metric("🤖 Бот закрывает", f"{bot_pct:.1f}%")
+    m3.metric("👤 Нужен оператор", f"{human_pct:.1f}%")
+
+    st.markdown("---")
+
+    hotel_stats = (ba.groupby(["hotel_name", "label"])
+                   .size().reset_index(name="n"))
+    hotel_stats["pct"] = (
+        hotel_stats["n"] /
+        hotel_stats.groupby("hotel_name")["n"].transform("sum") * 100
+    ).round(1)
+    hotel_stats["label_ru"] = hotel_stats["label"].map({"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"})
+
+    fig_ba = px.bar(
+        hotel_stats, x="hotel_name", y="pct", color="label_ru", barmode="stack",
+        color_discrete_map={"🤖 Бот": "#22c55e", "👤 Оператор": "#ef4444"},
+        labels={"pct": "% тредов", "hotel_name": "Отель", "label_ru": ""},
+    )
+    fig_ba.update_layout(height=320, margin=dict(t=10, b=10),
+                         legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig_ba, use_container_width=True)
+
+    st.markdown("---")
 
     fc1, fc2, fc3 = st.columns([2, 2, 1])
     with fc1:
-        cat_filter = st.multiselect("Категория",
-            ["PROBLEM","QUESTION","OTHER"], default=["PROBLEM","QUESTION"],
-            format_func=lambda x: {"PROBLEM":"🔧 Проблема","QUESTION":"❓ Вопрос","OTHER":"💬 Прочее"}[x])
+        label_filter = st.multiselect(
+            "Метка", ["BOT", "HUMAN"], default=["BOT", "HUMAN"],
+            format_func=lambda x: {"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"}[x])
     with fc2:
-        keyword = st.text_input("Поиск", placeholder="уборка, wifi, залог...")
+        keyword_ba = st.text_input("Поиск", placeholder="wifi, уборка, залог...")
     with fc3:
-        min_conf = st.slider("Мин. уверенность", 0.0, 1.0, 0.0, 0.1)
+        min_conf_ba = st.slider("Мин. уверенность", 0.0, 1.0, 0.0, 0.1)
 
-    view = th[th["category"].isin(cat_filter) & (th["confidence"] >= min_conf)].copy()
-    if keyword:
-        view = view[view["text"].str.contains(keyword, case=False, na=False) |
-                    view["reason"].str.contains(keyword, case=False, na=False)]
+    view_ba = ba[ba["label"].isin(label_filter) & (ba["confidence"] >= min_conf_ba)].copy()
+    if keyword_ba:
+        view_ba = view_ba[
+            view_ba["text"].str.contains(keyword_ba, case=False, na=False) |
+            view_ba["reason"].str.contains(keyword_ba, case=False, na=False)
+        ]
+    view_ba["Метка"] = view_ba["label"].map({"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"})
 
-    view["Категория"] = view["category"].map(
-        {"PROBLEM":"🔧 Проблема","QUESTION":"❓ Вопрос","OTHER":"💬 Прочее"})
-    st.caption(f"Найдено: {len(view):,} тредов")
+    st.caption(f"Найдено: {len(view_ba):,} тредов")
     st.dataframe(
-        view[["ID_booking","thread_id","Категория","thread_start",
-              "n_guest_msgs","confidence","reason","text"]]
+        view_ba[["hotel_name", "ID_booking", "Метка", "thread_start",
+                 "n_guest_msgs", "confidence", "reason", "text"]]
         .sort_values("thread_start", ascending=False)
-        .rename(columns={"ID_booking":"Бронирование","thread_id":"Тред №",
-                         "thread_start":"Начало","n_guest_msgs":"Сообщений",
-                         "confidence":"Уверенность","reason":"Причина","text":"Текст"}),
-        use_container_width=True, height=520,
+        .rename(columns={
+            "hotel_name": "Отель", "ID_booking": "Бронирование",
+            "thread_start": "Начало", "n_guest_msgs": "Сообщений",
+            "confidence": "Уверенность", "reason": "Причина", "text": "Текст",
+        }),
+        use_container_width=True, height=500,
         column_config={
             "Уверенность": st.column_config.ProgressColumn(
                 "Уверенность", min_value=0.0, max_value=1.0, format="%.2f"),
             "Текст":   st.column_config.TextColumn("Текст",   width="large"),
             "Причина": st.column_config.TextColumn("Причина", width="medium"),
-        })
-
-    with st.expander("ℹ️ Как это работает?"):
-        st.markdown("""
-**Категория** — каждый тред классифицирован языковой моделью на три типа:
-- 🔧 **Проблема** — гость сообщает о чём-то неработающем или выражает недовольство (сломан кондиционер, не убрали номер, шум).
-- ❓ **Вопрос** — гость спрашивает информацию (время заезда, парковка, завтрак).
-- 💬 **Прочее** — приветствия, благодарности, нейтральный обмен.
-
-**Уверенность** — насколько модель уверена в своей классификации (от 0 до 1). Значение 0.9+ означает однозначный случай; 0.5–0.7 — пограничный тред, где категория спорная.
-
-**Причина** — краткое объяснение от модели, почему тред отнесён именно в эту категорию.
-
-**Поиск** — фильтрует треды по ключевому слову одновременно в тексте переписки и в причине классификации.
-
-**Фильтр «Мин. уверенность»** — позволяет показать только однозначно классифицированные треды (например, от 0.8).
-        """)
+        }
+    )
 
