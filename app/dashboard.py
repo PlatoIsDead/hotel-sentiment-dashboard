@@ -9,8 +9,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
 
 st.set_page_config(
     page_title="Аналитика отелей",
@@ -26,26 +24,13 @@ BUCKET_ORDER  = ["<=5m", "5-15m", "15-60m", ">60m"]
 BUCKET_LABELS = {"<=5m": "≤5 мин", "5-15m": "5–15 мин", "15-60m": "15–60 мин", ">60m": ">60 мин"}
 BUCKET_COLORS = ["#22c55e", "#86efac", "#fbbf24", "#ef4444"]
 
-STOP_RU = [
-    "и","в","не","на","что","я","с","он","а","как","это","но","по","к","у","из",
-    "за","то","до","мне","вы","мы","же","для","бы","все","так","уже","если","или",
-    "да","нет","при","от","об","со","во","его","её","их","ее","был","была","были",
-    "будет","есть","вот","там","здесь","чтобы","когда","который","можно","можете",
-    "можем","пожалуйста","спасибо","добрый","доброго","здравствуйте","привет",
-    "день","вечер","утро","дня","вечера","утра","хорошо","ладно","понял","поняла",
-    "окей","ок","пока","сегодня","завтра","вчера","номер","номера","номере",
-    "отель","отеля","отеле","нас","вас","них","нам","вам","им","ему","ей",
-    "меня","тебя","тебе","себя","себе","этот","эта","эти","того","тех","том",
-    "один","два","три","раз","очень","также","тоже","чтоб","потому","поэтому",
-    "большое","благодарю","заранее","просьба","прошу","подскажите","скажите",
-    "скиньте","пришлите","отправьте","напишите",
-]
 
 @st.cache_data
 def load():
-    br = pd.read_parquet(BASE / "booking_risk.parquet")
-    hs = pd.read_parquet(BASE / "hotel_summary.parquet")
-    th = pd.read_parquet(BASE / "threads_sample_classified.parquet")
+    br = pd.read_parquet(BASE / "data/booking_risk.parquet")
+    hs = pd.read_parquet(BASE / "data/hotel_summary.parquet")
+    th = pd.read_parquet(BASE / "data/threads_sample_classified.parquet")
+    ht = pd.read_parquet(BASE / "data/hotel_topics.parquet")
     br["first_guest_time"] = pd.to_datetime(br["first_guest_time"])
     br.loc[br["reply_time_min"] < 0, "reply_time_min"] = np.nan
     br["year"]       = br["first_guest_time"].dt.year
@@ -53,31 +38,12 @@ def load():
     hs["hotel_name"] = hs["hotel_id"].map(HOTEL_NAMES)
     th["thread_start"] = pd.to_datetime(th["thread_start"])
     th["hotel_name"] = th["hotel_id"].map(HOTEL_NAMES)
-    return br, hs, th
+    return br, hs, th, ht
 
-br, hs, th = load()
+br, hs, th, ht = load()
 ALL_YEARS  = sorted(br["year"].dropna().unique().tolist())
 ALL_HOTELS = sorted(br["hotel_id"].unique().tolist())
 
-@st.cache_data
-def cluster_questions(n_topics: int):
-    q_texts = th[th["category"] == "QUESTION"]["text"].tolist()
-    n_topics = min(n_topics, max(5, len(q_texts) // 5))
-    vec = TfidfVectorizer(max_features=1000, ngram_range=(1, 2), min_df=3,
-                          sublinear_tf=True, stop_words=STOP_RU)
-    X = vec.fit_transform(q_texts)
-    km = KMeans(n_clusters=n_topics, random_state=42, n_init=10)
-    labels = km.fit_predict(X)
-    terms = vec.get_feature_names_out()
-    rows = []
-    for i, center in enumerate(km.cluster_centers_):
-        top_idx   = center.argsort()[-5:][::-1]
-        top_terms = [terms[j] for j in top_idx]
-        size      = int((labels == i).sum())
-        cluster_texts = [t for t, l in zip(q_texts, labels) if l == i]
-        example = cluster_texts[0][:150].replace("\n---\n", " / ")
-        rows.append({"Тема": ", ".join(top_terms), "Кол-во тредов": size, "Пример": example})
-    return pd.DataFrame(rows).sort_values("Кол-во тредов", ascending=False).reset_index(drop=True)
 
 st.title("🏨 Аналитика гостевых коммуникаций")
 tab1, tab2, tab3 = st.tabs(["📊 Статистика по отелям", "❓ Топ вопросы", "🔍 Браузер тредов"])
@@ -158,26 +124,60 @@ with tab1:
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_buck, use_container_width=True)
 
+    with st.expander("ℹ️ Как считаются эти метрики?"):
+        st.markdown("""
+**Бронирований** — общее количество уникальных броней по отелю за всё время.
+
+**% с ответом** — доля броней, где гость получил хотя бы один ответ от сотрудника. Например, 85% означает, что в 15% случаев гость написал, но ответа не последовало.
+
+**Медиана (мин)** — половина гостей получила ответ быстрее этого времени, половина — дольше. Медиана лучше среднего: не искажается редкими случаями, когда ответ ждали несколько часов.
+
+**Среднее (мин)** — среднее арифметическое времени ответа. Может быть завышено из-за единичных долгих ответов.
+
+**P90 (мин)** — 90% гостей получили ответ быстрее этого времени. Показывает «худший типичный сценарий» — насколько долго ждут самые невезучие гости.
+
+**Без ответа** — количество броней, где ответа так и не последовало.
+
+**% негатива** — доля сообщений гостя, классифицированных как негативные (жалоба, претензия, проблема). Считается языковой моделью на основе текста переписки.
+
+**Боксплот** — показывает разброс времени ответа. Линия внутри коробки — медиана, границы коробки — 25–75% случаев, усы — до 95-го перцентиля (выбросы обрезаны для читаемости).
+
+**Стопки по скорости ответа** — каждый столбец показывает, какой % броней получил ответ в течение ≤5 мин, 5–15 мин, 15–60 мин или >60 мин.
+        """)
+
 # ── Вкладка 2 ─────────────────────────────────────────────────────────────────
 with tab2:
-    st.subheader("Топ вопросы гостей")
-    st.caption(f"О-44 · последний месяц · {(th['category']=='QUESTION').sum()} тредов · TF-IDF без LLM")
-    n_topics = st.slider("Количество тем", 5, 25, 15, 1)
-    with st.spinner("Кластеризация..."):
-        topics_df = cluster_questions(n_topics)
-    fig_topics = px.bar(topics_df, x="Кол-во тредов", y="Тема", orientation="h",
-                        color="Кол-во тредов", color_continuous_scale="Blues",
-                        hover_data=["Пример"])
-    fig_topics.update_layout(height=max(380, n_topics * 30), margin=dict(t=10, b=10),
-                              yaxis=dict(autorange="reversed"), coloraxis_showscale=False)
+    st.subheader("Топ темы обращений гостей")
+
+    all_hotels_ht = sorted(ht["hotel_name"].unique().tolist())
+    sel_hotel = st.selectbox("Отель", all_hotels_ht)
+    view_ht = ht[ht["hotel_name"] == sel_hotel].copy()
+
+    fig_topics = px.bar(
+        view_ht, x="% от отеля", y="Ключевые слова", orientation="h",
+        color="% от отеля", color_continuous_scale="Blues",
+        hover_data=["Сообщений", "Пример"],
+        labels={"% от отеля": "% сообщений", "Ключевые слова": ""},
+    )
+    fig_topics.update_layout(
+        height=max(380, len(view_ht) * 32),
+        margin=dict(t=10, b=10),
+        yaxis=dict(autorange="reversed"),
+        coloraxis_showscale=False,
+    )
     st.plotly_chart(fig_topics, use_container_width=True)
-    st.dataframe(topics_df, use_container_width=True, hide_index=True,
-                 column_config={
-                     "Кол-во тредов": st.column_config.ProgressColumn(
-                         "Кол-во тредов", min_value=0,
-                         max_value=int(topics_df["Кол-во тредов"].max()), format="%d"),
-                     "Пример": st.column_config.TextColumn("Пример треда", width="large"),
-                 })
+
+    st.dataframe(
+        view_ht[["Ключевые слова", "Сообщений", "% от отеля", "Пример"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Сообщений": st.column_config.ProgressColumn(
+                "Сообщений", min_value=0,
+                max_value=int(view_ht["Сообщений"].max()), format="%d"),
+            "Пример": st.column_config.TextColumn("Пример", width="large"),
+        }
+    )
+
 
 # ── Вкладка 3 ─────────────────────────────────────────────────────────────────
 with tab3:
@@ -217,3 +217,20 @@ with tab3:
             "Текст":   st.column_config.TextColumn("Текст",   width="large"),
             "Причина": st.column_config.TextColumn("Причина", width="medium"),
         })
+
+    with st.expander("ℹ️ Как это работает?"):
+        st.markdown("""
+**Категория** — каждый тред классифицирован языковой моделью на три типа:
+- 🔧 **Проблема** — гость сообщает о чём-то неработающем или выражает недовольство (сломан кондиционер, не убрали номер, шум).
+- ❓ **Вопрос** — гость спрашивает информацию (время заезда, парковка, завтрак).
+- 💬 **Прочее** — приветствия, благодарности, нейтральный обмен.
+
+**Уверенность** — насколько модель уверена в своей классификации (от 0 до 1). Значение 0.9+ означает однозначный случай; 0.5–0.7 — пограничный тред, где категория спорная.
+
+**Причина** — краткое объяснение от модели, почему тред отнесён именно в эту категорию.
+
+**Поиск** — фильтрует треды по ключевому слову одновременно в тексте переписки и в причине классификации.
+
+**Фильтр «Мин. уверенность»** — позволяет показать только однозначно классифицированные треды (например, от 0.8).
+        """)
+
