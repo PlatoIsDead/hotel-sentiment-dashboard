@@ -32,21 +32,29 @@ def load_all():
     daily = pd.read_parquet(BASE / "data/daily_response.parquet")
     th    = pd.read_parquet(BASE / "data/threads_sample_classified.parquet")
     ht    = pd.read_parquet(BASE / "data/hotel_topics.parquet")
-    ba    = pd.read_parquet(BASE / "data/bot_answerability.parquet")
     br["first_guest_time"] = pd.to_datetime(br["first_guest_time"])
     br["year"] = br["first_guest_time"].dt.year
     daily["date"] = pd.to_datetime(daily["date"])
     th["thread_start"] = pd.to_datetime(th["thread_start"])
     th["hotel_name"] = th["hotel_id"].map(HOTEL_NAMES)
-    return br, hs, daily, th, ht, ba
 
-br, hs, daily, th, ht, ba = load_all()
+    gt, tt = None, None
+    gt_path = BASE / "data/guest_topics_3m.parquet"
+    tt_path = BASE / "data/thread_topics_3m.parquet"
+    if gt_path.exists():
+        gt = pd.read_parquet(gt_path)
+    if tt_path.exists():
+        tt = pd.read_parquet(tt_path)
+        tt["thread_start"] = pd.to_datetime(tt["thread_start"])
+    return br, hs, daily, th, ht, gt, tt
+
+br, hs, daily, th, ht, gt, tt = load_all()
 ALL_YEARS  = sorted(br["year"].dropna().unique().tolist())
 ALL_HOTELS = sorted(br["hotel_id"].unique().tolist())
 
 
 st.title("🏨 Аналитика гостевых коммуникаций")
-tab1, tab2, tab3 = st.tabs(["📊 Статистика по отелям", "❓ Топ темы", "🤖 Бот vs Оператор"])
+tab1, tab2, tab3 = st.tabs(["📊 Статистика по отелям", "❓ Топ темы", "🗣️ Горячие темы (3 мес.)"])
 
 # ── Вкладка 1 ─────────────────────────────────────────────────────────────────
 with tab1:
@@ -165,73 +173,76 @@ with tab2:
 
 # ── Вкладка 3 ─────────────────────────────────────────────────────────────────
 with tab3:
-    st.subheader("Бот vs Оператор")
-    st.caption(f"{ba['thread_start'].min().date()} — {ba['thread_start'].max().date()} · "
-               f"{len(ba)} тредов · {ba['ID_booking'].nunique()} бронирований · "
-               f"{ba['hotel_name'].nunique()} отеля")
+    st.subheader("Горячие темы гостей — последние 3 месяца")
 
-    bot_pct = (ba["label"] == "BOT").mean() * 100
-    human_pct = 100 - bot_pct
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Всего тредов", len(ba))
-    m2.metric("🤖 Бот закрывает", f"{bot_pct:.1f}%")
-    m3.metric("👤 Нужен оператор", f"{human_pct:.1f}%")
+    if gt is None:
+        st.info("Данные не найдены. Запустите `notebooks/bot_answerability.ipynb`.")
+        st.stop()
 
-    st.markdown("---")
+    period_cap = ""
+    if tt is not None and len(tt) > 0:
+        period_cap = (f"{tt['thread_start'].min().date()} — {tt['thread_start'].max().date()} · "
+                      f"{tt['ID_booking'].nunique():,} бронирований · ")
+    st.caption(f"{period_cap}{gt['hotel_name'].nunique()} отелей")
 
-    hotel_stats = (ba.groupby(["hotel_name", "label"])
-                   .size().reset_index(name="n"))
-    hotel_stats["pct"] = (
-        hotel_stats["n"] /
-        hotel_stats.groupby("hotel_name")["n"].transform("sum") * 100
-    ).round(1)
-    hotel_stats["label_ru"] = hotel_stats["label"].map({"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"})
+    sel_hotel_t3 = st.selectbox("Отель", sorted(gt["hotel_name"].unique()), key="t3_hotel")
+    view_gt = gt[gt["hotel_name"] == sel_hotel_t3].sort_values("n_threads", ascending=False)
 
-    fig_ba = px.bar(
-        hotel_stats, x="hotel_name", y="pct", color="label_ru", barmode="stack",
-        color_discrete_map={"🤖 Бот": "#22c55e", "👤 Оператор": "#ef4444"},
-        labels={"pct": "% тредов", "hotel_name": "Отель", "label_ru": ""},
+    fig_gt = px.bar(
+        view_gt, x="n_threads", y="topic", orientation="h",
+        color="pct_of_hotel", color_continuous_scale="Blues",
+        hover_data={"pct_of_hotel": True, "example": True, "n_threads": False},
+        labels={"n_threads": "Тредов", "topic": "", "pct_of_hotel": "% тредов"},
     )
-    fig_ba.update_layout(height=320, margin=dict(t=10, b=10),
-                         legend=dict(orientation="h", yanchor="bottom", y=1.02))
-    st.plotly_chart(fig_ba, use_container_width=True)
+    fig_gt.update_layout(
+        height=max(380, len(view_gt) * 40),
+        margin=dict(t=10, b=10),
+        yaxis=dict(autorange="reversed"),
+        coloraxis_showscale=False,
+    )
+    st.plotly_chart(fig_gt, use_container_width=True)
 
-    st.markdown("---")
-
-    fc1, fc2, fc3 = st.columns([2, 2, 1])
-    with fc1:
-        label_filter = st.multiselect(
-            "Метка", ["BOT", "HUMAN"], default=["BOT", "HUMAN"],
-            format_func=lambda x: {"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"}[x])
-    with fc2:
-        keyword_ba = st.text_input("Поиск", placeholder="wifi, уборка, залог...")
-    with fc3:
-        min_conf_ba = st.slider("Мин. уверенность", 0.0, 1.0, 0.0, 0.1)
-
-    view_ba = ba[ba["label"].isin(label_filter) & (ba["confidence"] >= min_conf_ba)].copy()
-    if keyword_ba:
-        view_ba = view_ba[
-            view_ba["text"].str.contains(keyword_ba, case=False, na=False) |
-            view_ba["reason"].str.contains(keyword_ba, case=False, na=False)
-        ]
-    view_ba["Метка"] = view_ba["label"].map({"BOT": "🤖 Бот", "HUMAN": "👤 Оператор"})
-
-    st.caption(f"Найдено: {len(view_ba):,} тредов")
     st.dataframe(
-        view_ba[["hotel_name", "ID_booking", "Метка", "thread_start",
-                 "n_guest_msgs", "confidence", "reason", "text"]]
-        .sort_values("thread_start", ascending=False)
-        .rename(columns={
-            "hotel_name": "Отель", "ID_booking": "Бронирование",
-            "thread_start": "Начало", "n_guest_msgs": "Сообщений",
-            "confidence": "Уверенность", "reason": "Причина", "text": "Текст",
+        view_gt[["topic", "n_threads", "pct_of_hotel", "example"]].rename(columns={
+            "topic": "Тема", "n_threads": "Тредов",
+            "pct_of_hotel": "% тредов", "example": "Пример",
         }),
-        use_container_width=True, height=500,
+        use_container_width=True, hide_index=True,
         column_config={
-            "Уверенность": st.column_config.ProgressColumn(
-                "Уверенность", min_value=0.0, max_value=1.0, format="%.2f"),
-            "Текст":   st.column_config.TextColumn("Текст",   width="large"),
-            "Причина": st.column_config.TextColumn("Причина", width="medium"),
-        }
+            "Тредов": st.column_config.ProgressColumn(
+                "Тредов", min_value=0, max_value=int(view_gt["n_threads"].max()), format="%d"),
+            "Пример": st.column_config.TextColumn("Пример", width="large"),
+        },
     )
+
+    if tt is not None and len(tt) > 0:
+        st.markdown("---")
+        st.subheader("Треды")
+
+        view_tt = tt[tt["hotel_name"] == sel_hotel_t3].copy()
+        fc1, fc2 = st.columns([2, 3])
+        with fc1:
+            topics_in_hotel = ["Все"] + sorted(view_tt["topic"].unique())
+            sel_topic = st.selectbox("Тема", topics_in_hotel, key="t3_topic")
+        with fc2:
+            kw_t3 = st.text_input("Поиск по тексту", placeholder="уборка, wifi...", key="t3_kw")
+
+        if sel_topic != "Все":
+            view_tt = view_tt[view_tt["topic"] == sel_topic]
+        if kw_t3:
+            view_tt = view_tt[view_tt["text"].str.contains(kw_t3, case=False, na=False)]
+
+        st.caption(f"Найдено: {len(view_tt):,} тредов")
+        st.dataframe(
+            view_tt[["topic", "thread_start", "ID_booking", "n_guest_msgs", "text"]]
+            .sort_values("thread_start", ascending=False)
+            .rename(columns={
+                "topic": "Тема", "thread_start": "Начало",
+                "ID_booking": "Бронирование", "n_guest_msgs": "Сообщений", "text": "Текст",
+            }),
+            use_container_width=True, height=480,
+            column_config={
+                "Текст": st.column_config.TextColumn("Текст", width="large"),
+            },
+        )
 
