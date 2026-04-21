@@ -23,6 +23,11 @@ HOTEL_NAMES = {1: "БС74", 2: "МК16", 3: "Дубай", 4: "М73", 5: "О-44"}
 BUCKET_ORDER  = ["<=5m", "5-15m", "15-60m", ">60m"]
 BUCKET_LABELS = {"<=5m": "≤5 мин", "5-15m": "5–15 мин", "15-60m": "15–60 мин", ">60m": ">60 мин"}
 BUCKET_COLORS = ["#22c55e", "#86efac", "#fbbf24", "#ef4444"]
+MONTH_NAMES   = {1: "Янв", 2: "Фев", 3: "Мар", 4: "Апр", 5: "Май", 6: "Июн",
+                 7: "Июл", 8: "Авг", 9: "Сен", 10: "Окт", 11: "Ноя", 12: "Дек"}
+SLOW_BUCKETS       = [1440, 2880, 7200, 20160]   # minutes: 1d, 2d, 5d, 14d
+SLOW_BUCKET_LABELS = ["≤1 дня", "1–2 дня", "2–5 дней", "5–14 дней", ">14 дней"]
+SLOW_BUCKET_COLORS = ["#fbbf24", "#f97316", "#ef4444", "#b91c1c", "#7f1d1d"]
 
 
 @st.cache_data
@@ -33,22 +38,27 @@ def load_all():
     th    = pd.read_parquet(BASE / "data/threads_sample_classified.parquet")
     ht    = pd.read_parquet(BASE / "data/hotel_topics.parquet")
     br["first_guest_time"] = pd.to_datetime(br["first_guest_time"])
-    br["year"] = br["first_guest_time"].dt.year
+    br["year"]  = br["first_guest_time"].dt.year
+    br["month"] = br["first_guest_time"].dt.month
     daily["date"] = pd.to_datetime(daily["date"])
     th["thread_start"] = pd.to_datetime(th["thread_start"])
     th["hotel_name"] = th["hotel_id"].map(HOTEL_NAMES)
 
-    gt, tt = None, None
+    gt, tt, sl = None, None, None
     gt_path = BASE / "data/guest_topics_3m.parquet"
     tt_path = BASE / "data/thread_topics_3m.parquet"
+    sl_path = BASE / "data/slow_threads.parquet"
     if gt_path.exists():
         gt = pd.read_parquet(gt_path)
     if tt_path.exists():
         tt = pd.read_parquet(tt_path)
         tt["thread_start"] = pd.to_datetime(tt["thread_start"])
-    return br, hs, daily, th, ht, gt, tt
+    if sl_path.exists():
+        sl = pd.read_parquet(sl_path)
+        sl["thread_start"] = pd.to_datetime(sl["thread_start"])
+    return br, hs, daily, th, ht, gt, tt, sl
 
-br, hs, daily, th, ht, gt, tt = load_all()
+br, hs, daily, th, ht, gt, tt, sl = load_all()
 ALL_YEARS  = sorted(br["year"].dropna().unique().tolist())
 ALL_HOTELS = sorted(br["hotel_id"].unique().tolist())
 
@@ -88,13 +98,15 @@ with tab1:
 
     st.markdown("---")
 
-    fc1, fc2 = st.columns([3, 1])
+    fc1, fc2 = st.columns([2, 3])
     with fc1:
         sel_years = st.multiselect("Годы", ALL_YEARS, default=ALL_YEARS, format_func=str)
     with fc2:
-        pass
+        sel_months = st.multiselect(
+            "Месяцы", list(MONTH_NAMES.keys()), default=list(MONTH_NAMES.keys()),
+            format_func=lambda m: MONTH_NAMES[m])
 
-    br_y = br[br["year"].isin(sel_years)].copy()
+    br_y = br[br["year"].isin(sel_years) & br["month"].isin(sel_months)].copy()
 
     col1, col2 = st.columns(2)
 
@@ -122,6 +134,71 @@ with tab1:
         fig_buck.update_layout(height=340, margin=dict(t=10, b=10),
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_buck, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Треды без ответа в срок (> 24 ч)")
+
+    if sl is None:
+        st.info("Запустите `notebooks/response_analysis.ipynb` для загрузки данных.")
+    else:
+        last_year = sl["thread_start"].dt.year.max()
+        sl_last = sl[sl["thread_start"].dt.year == last_year].copy()
+
+        # ── Metrics ──────────────────────────────────────────────────────────
+        late = sl["actual_reply_min"].notna().sum()
+        never = sl["actual_reply_min"].isna().sum()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Всего тредов без ответа в 24ч", f"{len(sl):,}")
+        m2.metric("Ответили позже", f"{late:,}")
+        m3.metric("Так и не ответили", f"{never:,}")
+
+        # ── Distribution of late replies ──────────────────────────────────────
+        late_df = sl[sl["actual_reply_min"].notna()].copy()
+        if len(late_df) > 0:
+            def slow_bucket(m):
+                if m <= SLOW_BUCKETS[0]:  return SLOW_BUCKET_LABELS[0]
+                if m <= SLOW_BUCKETS[1]:  return SLOW_BUCKET_LABELS[1]
+                if m <= SLOW_BUCKETS[2]:  return SLOW_BUCKET_LABELS[2]
+                if m <= SLOW_BUCKETS[3]:  return SLOW_BUCKET_LABELS[3]
+                return SLOW_BUCKET_LABELS[4]
+            late_df["delay_bucket"] = late_df["actual_reply_min"].apply(slow_bucket)
+            bkt = (late_df.groupby(["hotel_name", "delay_bucket"]).size()
+                   .reset_index(name="n"))
+            fig_slow = px.bar(
+                bkt, x="hotel_name", y="n", color="delay_bucket", barmode="stack",
+                color_discrete_sequence=SLOW_BUCKET_COLORS,
+                category_orders={"delay_bucket": SLOW_BUCKET_LABELS},
+                labels={"n": "Тредов", "hotel_name": "Отель", "delay_bucket": ""},
+                title="Когда всё же ответили (среди тех, кто ответил поздно)",
+            )
+            fig_slow.update_layout(height=300, margin=dict(t=40, b=10),
+                                   legend=dict(orientation="h", yanchor="bottom", y=1.02))
+            st.plotly_chart(fig_slow, use_container_width=True)
+
+        # ── Top-10 longest waits per hotel (last year) ───────────────────────
+        st.markdown(f"**Топ-10 самых долгих ожиданий по отелям — {last_year} год**")
+        sel_slow_hotel = st.selectbox(
+            "Отель", sorted(sl_last["hotel_name"].unique()), key="sl_hotel")
+        view_sl = (
+            sl_last[sl_last["hotel_name"] == sel_slow_hotel]
+            .copy()
+            .sort_values("actual_reply_min", ascending=False)
+            .head(10)
+        )
+        view_sl["Ожидание"] = view_sl["actual_reply_min"].apply(
+            lambda m: f"{m/60:.1f} ч" if pd.notna(m) else "Нет ответа")
+        st.dataframe(
+            view_sl[["thread_start", "ID_booking", "n_guest_msgs", "Ожидание", "first_msg"]]
+            .rename(columns={
+                "thread_start": "Начало треда", "ID_booking": "Бронирование",
+                "n_guest_msgs": "Сообщений гостя", "first_msg": "Первое сообщение",
+            }),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Первое сообщение": st.column_config.TextColumn(
+                    "Первое сообщение", width="large"),
+            },
+        )
 
     st.markdown("---")
     with st.expander("ℹ️ Как считается время ответа"):
@@ -170,6 +247,19 @@ with tab2:
         }
     )
 
+    st.markdown("---")
+    with st.expander("ℹ️ Откуда берутся эти темы"):
+        st.markdown("""
+Берётся вся переписка гостей по выбранному отелю за всё время.
+Система автоматически находит слова, которые чаще всего встречаются вместе, —
+так получаются «кластеры» схожих сообщений.
+Каждый кластер — это тема. Проценты показывают,
+какая доля сообщений гостей попала в эту тему.
+
+Это **статистический** метод (TF-IDF + кластеризация) — он не читает смысл,
+а ищет повторяющиеся слова. Поэтому в одном кластере могут оказаться
+немного разные вопросы, зато покрывается вся история без ручной работы.
+""")
 
 # ── Вкладка 3 ─────────────────────────────────────────────────────────────────
 with tab3:
@@ -245,4 +335,23 @@ with tab3:
                 "Текст": st.column_config.TextColumn("Текст", width="large"),
             },
         )
+
+    st.markdown("---")
+    with st.expander("ℹ️ Как это работает"):
+        st.markdown("""
+Каждые 3 месяца система просматривает все переписки гостей
+и для каждого диалога определяет **одну главную тему** — например,
+«Уборка», «Wi-Fi», «Заселение / выезд» и т.д.
+
+Это делает искусственный интеллект (GPT-4o-mini): он читает текст гостя
+и выбирает подходящую категорию из готового списка тем.
+Никакой ручной разметки не нужно.
+
+В таблице и на графике видно, сколько диалогов попало в каждую тему
+и какой процент это составляет от всех обращений в отеле за период.
+В колонке «Пример» — реальная фраза гостя из этой темы.
+
+**Важно:** одна бронь может иметь несколько диалогов,
+и каждый считается отдельно. Тема присваивается по первым сообщениям гостя.
+""")
 
